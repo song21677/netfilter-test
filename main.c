@@ -1,14 +1,15 @@
+#include <set_iptable.c>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <regex.h>
 #include <netinet/in.h>
 #include <linux/types.h>
-#include <linux/netfilter.h>		/* for NF_ACCEPT */
+#include <linux/netfilter.h>
 #include <errno.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
-
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
 void dump(unsigned char* buf, int size) {
@@ -19,7 +20,7 @@ void dump(unsigned char* buf, int size) {
         printf("%02x ", buf[i]);
     }
 }
-/* returns packet id */
+// returns packet id
 static uint32_t print_pkt (struct nfq_data *tb)
 {
     int id = 0;
@@ -77,63 +78,84 @@ static uint32_t print_pkt (struct nfq_data *tb)
 
     ret = nfq_get_payload(tb, &data);
 
+
     if (ret >= 0){
         printf("payload_len=%d ", ret);
         dump(data, ret);
     }
+
 
     fputc('\n', stdout);
 
     return id;
 }
 
-//call back
+int netfilter(struct nfq_data *nfa, char *host){
+    int ret;
+    unsigned char *packet;
+    int check=1;
+
+    ret = nfq_get_payload(nfa, &packet);
+    if (ret >= 0){
+        const struct iphdr* ip = (struct iphdr*)(packet);
+        int ihl = ip->ihl*4;
+        if (ip->protocol != IPPROTO_TCP)
+            return check;
+
+        const struct tcphdr* tcp = (struct tcphdr*)(packet + ihl);
+        int thl = tcp->th_off*4;
+        const u_char *payload = packet + ihl + thl;
+
+        if (ntohs(tcp->th_dport) != 80)
+            return check;
+
+        if ( memcmp(payload, "GET ", 4) == 0 || memcmp(payload, "POST", 4) == 0) {
+            regex_t preg;
+            regmatch_t match[2];
+            char *pattern = "Host: \\(.*\\)\\\r";
+
+            ret = regcomp(&preg, pattern, REG_NEWLINE);
+
+            if(ret != 0 ) {
+                printf("regcomp() failed, returning nonzero (%d)\n", ret);
+                exit(EXIT_FAILURE);
+            }
+
+            if( regexec(&preg, (char *)payload, 2, match, 0) == 0 ) {
+                if( strlen(host) != (unsigned long)(match[1].rm_eo - match[1].rm_so) )
+                    return check;
+
+                if( memcmp(host, &payload[match[1].rm_so], strlen(host)) == 0 ) {
+                    check = 0;
+                }
+            }
+            else {
+                printf("Failed to match '%s' with '%s',returning %d.\n", payload, pattern, ret);
+            }
+
+            regfree(&preg);
+        }
+        return check;
+    }
+     exit(EXIT_FAILURE);
+}
+// call back
 static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
               struct nfq_data *nfa, void *host)
 {
-        int ret;
-        unsigned char *packet;
-        char *addr=NULL;
-        int check=1;
+    (void)nfmsg;
 
-        ret = nfq_get_payload(nfa, &packet);
-        if (ret >= 0){
-            uint32_t id = print_pkt(nfa);
-            printf("entering callback\n");
+    uint32_t id = print_pkt(nfa);
+    printf("entering callback\n");
 
-            const struct iphdr* ip = (struct iphdr*)(packet);
-            int ihl = ip->ihl*4;
-            if (ip->protocol == IPPROTO_TCP) {
-                    const struct tcphdr* tcp = (struct tcphdr*)(packet + ihl);
-                    int thl = tcp->th_off*4;
-                   if (ntohs(tcp->th_dport) == 0x0050) {
-                            const u_char *payload = packet + ihl + thl;
-                            if ((addr = strstr((char*)payload, "Host")) != NULL) {
-                                char tmp[100] = {0,};
-                                addr+=6;
-                                for (int i=0; *addr != '\r'; i++, addr++) {
-                                    tmp[i] = *addr;
-                                }
-                                for (int i=0; tmp[i] != 0; i++, host++) {
-                                    if (tmp[i] == *((char*)host)) {
-                                        check=0;
-                                    }
-                                    else {
-                                        check=1;
-                                        break;
-                                    }
-                                }
-                            }
-                    }
-            }
-            if (check==0) return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-            else return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
-        }
-        return -1;
+    int v = netfilter(nfa, (char *)host) == 0 ? NF_DROP : NF_ACCEPT;
+
+    return nfq_set_verdict(qh, id, v, 0, NULL);
 }
 
 int main(int argc, char *argv[])
 {
+    (void)argc;
     struct nfq_handle *h;
     struct nfq_q_handle *qh;
     int fd;
@@ -141,6 +163,8 @@ int main(int argc, char *argv[])
     uint32_t queue = 0;
     char buf[4096] __attribute__ ((aligned));
     char* host = argv[1];
+
+    set_iptable();
 
     printf("opening library handle\n");
     h = nfq_open();
@@ -226,3 +250,4 @@ int main(int argc, char *argv[])
 
     exit(0);
 }
+
